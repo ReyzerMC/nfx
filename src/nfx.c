@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <zstd.h>
+#include <zip.h>
 
 #define BUF_SIZE 65536 // 64KB Buffer
 
@@ -113,7 +114,7 @@ int nfx_compress(const char *input_path, const char *output_file, int level) {
     uint32_t file_count = 0;
     uint64_t total_bytes = 0;
 
-    printf("Scaning for files...\n");
+    printf("Escaneando archivos...\n");
     // Escaneo inteligente: detecta si input_path es archivo o carpeta
     struct stat path_stat;
     if (stat(input_path, &path_stat) != 0) { perror("stat input"); return -1; }
@@ -131,7 +132,7 @@ int nfx_compress(const char *input_path, const char *output_file, int level) {
     }
 
     if (file_count == 0) {
-        printf("No files found.\n");
+        printf("No se encontraron archivos para comprimir.\n");
         return 0;
     }
 
@@ -163,7 +164,7 @@ int nfx_compress(const char *input_path, const char *output_file, int level) {
         /* 2. Comprimir contenido del archivo */
         FILE *in = fopen(curr->full_path, "rb");
         if (!in) { 
-            fprintf(stderr, "Error reading: %s\n", curr->full_path);
+            fprintf(stderr, "No se pudo leer: %s\n", curr->full_path);
             curr = curr->next; 
             continue; 
         }
@@ -267,10 +268,10 @@ int nfx_decompress(const char *input_file, const char *output_dir) {
     /* Leer header */
     nfx_header_t hdr;
     if (!buf_read_bytes(&br, &hdr, sizeof(hdr))) { fclose(in); free(io_buf); return -2; }
-    if (hdr.magic[0]!='n') { printf("Invalid Format\n"); fclose(in); free(io_buf); return -3; }
+    if (hdr.magic[0]!='n') { printf("Formato inválido\n"); fclose(in); free(io_buf); return -3; }
 
     /* Mantenemos el mensaje */
-    printf("Extracting %d files to '%s'...\n", hdr.files, output_dir);
+    printf("Extrayendo %d archivos a '%s'...\n", hdr.files, output_dir);
     
     /* Iniciamos la barra de progreso */
     progress_start(total_nfx_size);
@@ -308,9 +309,6 @@ int nfx_decompress(const char *input_file, const char *output_dir) {
 
         FILE *out = fopen(full_path, "wb");
         if (!out) { perror(full_path); continue; }
-
-        /* Comentamos esto para no romper la barra de progreso visualmente */
-        /* printf("  -> %s\n", path); */
 
         /* Descompresión del Frame ZSTD */
         ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only);
@@ -355,5 +353,86 @@ int nfx_decompress(const char *input_file, const char *output_dir) {
     free(io_buf);
     ZSTD_freeDCtx(dctx);
     fclose(in);
+    return 0;
+}
+
+int uncompress_zip(const char *input_file, const char *output_dir) {
+    int err = 0;
+    struct zip *za = zip_open(input_file, 0, &err);
+    if (!za) {
+        zip_error_t zerr;
+        zip_error_init_with_code(&zerr, err);
+        fprintf(stderr, "No se pudo abrir el zip: %s\n", zip_error_strerror(&zerr));
+        return -1;
+    }
+
+    /* Obtener tamaño total comprimido para la barra de progreso */
+    uint64_t total_compressed_size = 0;
+    zip_int64_t num_entries = zip_get_num_entries(za, 0);
+    for (zip_int64_t i = 0; i < num_entries; i++) {
+        struct zip_stat st;
+        zip_stat_index(za, i, 0, &st);
+        total_compressed_size += st.comp_size;
+    }
+
+    progress_start(total_compressed_size);
+    uint64_t processed_compressed_bytes = 0;
+
+    /* Crear directorio de salida */
+    mkdir(output_dir, 0755);
+
+    /* Iterar y extraer */
+    for (zip_int64_t i = 0; i < num_entries; i++) {
+        struct zip_stat st;
+        zip_stat_index(za, i, 0, &st);
+
+        char full_path[2048];
+        snprintf(full_path, sizeof(full_path), "%s/%s", output_dir, st.name);
+
+        /* Manejar directotios dentro del zip */
+        if (st.name[strlen(st.name) - 1] == '/') {
+            mkdir(full_path, 0755);
+            continue;
+        }
+
+        /* Asegurar que el directorio padre existe */
+        char *slash = strrchr(full_path, '/');
+        if (slash) {
+            *slash = 0;
+            char cmd[2100];
+            snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", full_path);
+            system(cmd);
+            *slash = '/';
+        }
+
+        struct zip_file *zf = zip_fopen_index(za, i, 0);
+        if (!zf) continue;
+
+        FILE * out = fopen(full_path, "wb");
+        if (!out) {
+            zip_fclose(zf);
+            continue;
+        }
+
+        uint8_t buffer[BUF_SIZE];
+        zip_int64_t nbytes;
+        uint64_t file_processed_comp = 0;
+
+        while ((nbytes = zip_fread(zf, buffer, sizeof(buffer))) > 0) {
+            fwrite(buffer, 1, nbytes, out);
+
+            /* --- CALCULO DE PROGRESO */
+            double ratio = (double)st.comp_size / st.size;
+            processed_compressed_bytes += (uint64_t)(nbytes * ratio);
+
+            progress_update(processed_compressed_bytes);
+        }
+
+        fclose(out);
+        zip_fclose(zf);
+    }
+
+    progress_finish();
+    zip_close(za);
     return 0;
 }
